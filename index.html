@@ -59,9 +59,9 @@
 </head>
 <body>
 
-<div id="visitorBadge" title="จำนวนครั้งที่เปิดดูแผนที่">
+<div id="visitorBadge" title="จำนวนคนที่เปิดหน้าเว็บอยู่ตอนนี้">
   <span class="dot" aria-hidden="true"></span>
-  <span>ผู้เข้าชม <strong id="visitorCount">...</strong></span>
+  <span>ออนไลน์ <strong id="visitorCount">...</strong> คน</span>
 </div>
 
 <select id="mapSelector">
@@ -72,6 +72,7 @@
 <div id="map"></div>
 
 <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 <script>
 
   const imageWidth = 8192;
@@ -1039,38 +1040,88 @@
     console.log(`CLICK: Leaflet(${lx}, ${ly}) -> GTA(${gx}, ${gy})`);
   });
 
-  (function trackVisitors() {
+  // นับคนที่เปิดหน้าเว็บอยู่ตอนนี้ (presence แบบเรียลไทม์)
+  (function trackOnlineUsers() {
     const el = document.getElementById('visitorCount');
-    const namespace = 'whatspace-map';
-    const key = 'pageviews';
-    const localKey = 'whatspace_local_views';
+    const room = 'whatspace-map/online';
+    const staleMs = 45000;
+    const heartbeatMs = 15000;
+    const myId = 'u_' + Math.random().toString(36).slice(2) + '_' + Date.now().toString(36);
+    const myTopic = room + '/' + myId;
+    const online = new Map();
 
-    function formatCount(n) {
-      return Number(n).toLocaleString('th-TH');
-    }
-
-    function bumpLocal() {
-      const next = (parseInt(localStorage.getItem(localKey) || '0', 10) || 0) + 1;
-      localStorage.setItem(localKey, String(next));
-      return next;
-    }
-
-    function show(n) {
-      el.textContent = formatCount(n);
-    }
-
-    fetch(`https://api.countapi.xyz/hit/${namespace}/${key}`)
-      .then(function (res) { return res.json(); })
-      .then(function (data) {
-        if (data && typeof data.value === 'number') {
-          show(data.value);
-        } else {
-          show(bumpLocal());
-        }
-      })
-      .catch(function () {
-        show(bumpLocal());
+    function show() {
+      const now = Date.now();
+      let count = 0;
+      online.forEach(function (ts, id) {
+        if (now - ts > staleMs) online.delete(id);
+        else count += 1;
       });
+      el.textContent = count.toLocaleString('th-TH');
+    }
+
+    function publishPresence() {
+      if (!client || !client.connected) return;
+      client.publish(myTopic, String(Date.now()), { qos: 0, retain: true });
+      online.set(myId, Date.now());
+      show();
+    }
+
+    function clearPresence() {
+      if (!client) return;
+      try {
+        client.publish(myTopic, '', { qos: 0, retain: true });
+        client.end(true);
+      } catch (e) {}
+    }
+
+    if (typeof mqtt === 'undefined') {
+      el.textContent = '1';
+      return;
+    }
+
+    const client = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
+      clientId: 'whatspace_' + myId,
+      clean: true,
+      reconnectPeriod: 3000,
+      connectTimeout: 10000,
+      will: {
+        topic: myTopic,
+        payload: '',
+        retain: true,
+        qos: 0
+      }
+    });
+
+    client.on('connect', function () {
+      client.subscribe(room + '/#', { qos: 0 });
+      publishPresence();
+    });
+
+    client.on('message', function (topic, payload) {
+      if (!topic.startsWith(room + '/')) return;
+      const id = topic.slice(room.length + 1);
+      if (!id) return;
+      const raw = payload.toString();
+      if (!raw) {
+        online.delete(id);
+      } else {
+        const ts = parseInt(raw, 10);
+        if (!isNaN(ts)) online.set(id, ts);
+      }
+      show();
+    });
+
+    client.on('error', function () {
+      online.set(myId, Date.now());
+      show();
+    });
+
+    setInterval(publishPresence, heartbeatMs);
+    setInterval(show, 5000);
+
+    window.addEventListener('pagehide', clearPresence);
+    window.addEventListener('beforeunload', clearPresence);
   })();
 
 </script>
